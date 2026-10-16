@@ -173,3 +173,7 @@ If NotchCue helps you, please ⭐ star the repo. It helps other people find it.
 ## Licence
 
 MIT
+
+---
+
+Built by the [Lycana](https://lycana.ai) team.
