@@ -8,7 +8,31 @@ It only uses what's built into macOS: Apple's speech recognition runs on your Ma
 
 ## Install
 
-Needs macOS 13 or later and the Xcode command line tools (`xcode-select --install`).
+Needs macOS 13 (Ventura) or later, on Apple silicon or Intel.
+
+### Homebrew (coming soon)
+
+```sh
+brew install --cask lycanaai/tap/notchcue
+```
+
+This installs NotchCue.app into `/Applications` and the `notchcue` command into Homebrew's `bin`. `brew upgrade --cask notchcue` updates both. Not available yet: it will work once the first public release is out.
+
+### Download
+
+Download `NotchCue-<version>.zip` from [Releases](https://github.com/LycanaAI/notchcue/releases), unzip it and drag NotchCue.app into Applications.
+
+For the command line, link the launcher inside the app onto your `PATH`:
+
+```sh
+ln -s /Applications/NotchCue.app/Contents/Resources/notchcue /usr/local/bin/notchcue
+```
+
+Releases are signed with a Developer ID and notarised by Apple, so macOS opens them without warnings. Because every release is signed by the same developer, the microphone and speech permissions you grant carry over when you update.
+
+### Build from source
+
+Needs the Xcode command line tools (`xcode-select --install`).
 
 ```sh
 git clone https://github.com/LycanaAI/notchcue.git
@@ -21,7 +45,9 @@ This does two things:
 - **The app:** copies NotchCue.app into `~/Applications`, so you can open it from Spotlight (⌘Space, type "NotchCue") or Launchpad.
 - **The command:** links `notchcue` into `~/.local/bin`. Make sure that's on your `PATH`, or use `make install PREFIX=/usr/local`.
 
-Rebuilding from the command line also refreshes the copy in `~/Applications`. `make uninstall` removes both.
+Rebuilding from the command line also refreshes the copy in `~/Applications` (unless that copy is a downloaded release). `make uninstall` removes both.
+
+Local builds are signed with your Apple Development certificate if you have one (from Xcode), so macOS remembers the permissions across rebuilds. Without one they get an ad-hoc signature, and macOS asks again after each rebuild. To choose the certificate yourself, set `NOTCHCUE_SIGN_IDENTITY` to its name or SHA-1 hash, or to `-` for ad-hoc.
 
 The first time it listens, macOS asks for **Speech Recognition** and **Microphone** access. **Dictation must also be on**: System Settings → Keyboard → Dictation. Without it, Apple's speech recognition won't run and NotchCue tells you so.
 
@@ -130,7 +156,7 @@ Click the panel first so it has the keyboard.
 - **It doesn't react to my voice:**
   - Check that NotchCue is allowed in System Settings → Privacy & Security → **Microphone** and → **Speech Recognition**.
   - Check the speech language in Settings matches the language you're reading.
-- **macOS asks for permission again:** NotchCue is signed on your Mac without a developer certificate, so macOS treats each rebuild as a new app and asks again. This happens after you pull changes or edit the source. Allow it again; it won't ask again until the next rebuild.
+- **macOS asks for permission again:** releases are signed and notarised, so this shouldn't happen when you update. If you build from source without an Apple Development certificate, the build has an ad-hoc signature, macOS treats each rebuild as a new app, and it asks again after you pull changes or edit the source. Allow it again, or see [Build from source](#build-from-source) for signing with a certificate.
 - **The microphone is in use by another app:** if a video call or recording app has the microphone, NotchCue may hear nothing or say it couldn't start the microphone. Close or mute the other app, then press V (twice if needed) to start listening again. Recording apps that share the microphone, like QuickTime or OBS, usually work alongside it.
 - **"Speech recognition stopped":** press V to retry. If it keeps happening, run with `--debug` and look at `~/Library/Logs/notchcue.log`.
 - **I can't find the menu bar icon:** the panel covers the middle of the menu bar, and macOS hides icons that don't fit beside the notch, so on a crowded menu bar NotchCue's icon can end up hidden. Minimise the panel (M) to uncover more of the menu bar, quit some menu bar apps, or use the panel's hover controls and keys instead.
@@ -141,7 +167,8 @@ Click the panel first so it has the keyboard.
 - **Placement:** the panel is a borderless window at the top centre of the screen. Its top edge is the top of the screen: it covers the middle of the menu bar, and the notch sits inside its black top strip, so the notch and the panel look like one shape. The text starts just below the notch. On screens without a notch, the strip covers the middle of the menu bar in the same way.
 - **Following your voice:** `SFSpeechRecognizer` streams partial transcripts from the microphone. NotchCue compares the last few words heard with the script around your current place, allowing for misheard and skipped words, and moves forward to the best match. It only jumps backwards on a strong match, so a common word like "the" can't send it back.
 - **Why an app bundle:** macOS only lets apps with a reason in their `Info.plist` ask for the microphone and speech recognition, so the `notchcue` script builds a small `.app` and opens it.
-- **Building:** `swiftc` compiles the files in `Sources/` with no other dependencies. `make check` compiles and runs the built-in tests, as CI does.
+- **Building:** `swiftc` compiles the files in `Sources/` with no other dependencies. `make check` compiles and runs the built-in tests, as CI does. `make release` builds the signed and notarised zip; see [docs/releasing.md](docs/releasing.md).
+- **The command inside the app:** NotchCue.app carries the `notchcue` launcher in `Contents/Resources`. Run from there (or through a link to it), it opens the app it's in with your arguments and compiles nothing. Run from a source checkout, it builds first.
 
 ## Known quirks
 
