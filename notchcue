@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Opens NotchCue at the top centre of the screen, around the notch.
+# Builds the app on first run or after the source changes.
+#
+#   notchcue script.txt                     # follows your voice
+#   notchcue script.txt --steady --wpm 170  # steady scroll
+#   notchcue --text "Some sample text"
+#   echo "Text from a pipe" | notchcue -
+#
+# Returns straight away and leaves the window open. Add --wait to block until it closes.
+# Run with --help for all options and keys.
+set -euo pipefail
+
+# Resolve symlinks (e.g. ~/.local/bin/notchcue -> this file) to find the repo.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  link="$(readlink "$self")"
+  [[ "$link" == /* ]] && self="$link" || self="$(dirname "$self")/$link"
+done
+root="$(cd "$(dirname "$self")" && pwd)"
+
+src="$root/NotchCue.swift"
+plist="$root/Info.plist"
+app="$root/build/NotchCue.app"
+bin="$app/Contents/MacOS/notchcue"
+
+if [[ ! -x "$bin" || "$src" -nt "$bin" || "$plist" -nt "$bin" ]]; then
+  echo "Building NotchCue..." >&2
+  mkdir -p "$app/Contents/MacOS"
+  swiftc -O "$src" -o "$bin"
+  cp "$plist" "$app/Contents/Info.plist"
+  # Ad-hoc signature: enough for macOS to remember the permissions you grant.
+  codesign --force --sign - "$app" >/dev/null 2>&1
+fi
+
+wait=0
+args=()
+prev=""
+for arg in "$@"; do
+  case "$arg" in
+    --wait) wait=1 ;;
+    -h|--help) exec "$bin" --help ;;
+    -)
+      # Save piped text to a file so the window can outlive this command.
+      tmp="$(mktemp -t notchcue).txt"
+      cat > "$tmp"
+      args+=("$tmp")
+      ;;
+    *)
+      # The app starts in another directory, so pass the script file as a full path.
+      if [[ "$arg" != -* && "$prev" != --* && -f "$arg" ]]; then
+        arg="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
+      fi
+      args+=("$arg")
+      ;;
+  esac
+  prev="$arg"
+done
+
+# Catch bad options or unreadable files here, where the error is visible.
+"$bin" ${args[@]+"${args[@]}"} --validate
+
+# Close any NotchCue that's already open, so there's only one.
+pkill -f "$bin" 2>/dev/null || true
+
+if [[ $wait == 1 ]]; then
+  open -W -n "$app" --args ${args[@]+"${args[@]}"}
+else
+  open -n "$app" --args ${args[@]+"${args[@]}"}
+  echo "NotchCue opened at the top of the screen. Esc closes it."
+fi
