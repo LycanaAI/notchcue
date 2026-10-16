@@ -3,9 +3,11 @@
 # Builds the app on first run or after the source changes.
 #
 #   notchcue script.txt                     # follows your voice
+#   notchcue notes.md                       # Markdown, Word, RTF, HTML and PDF work too
 #   notchcue script.txt --steady --wpm 170  # steady scroll
 #   notchcue --text "Some sample text"
 #   echo "Text from a pipe" | notchcue -
+#   notchcue                                # welcome panel: drop, open or paste a script
 #
 # Returns straight away and leaves the window open. Add --wait to block until it closes.
 # Run with --help for all options and keys.
@@ -19,27 +21,42 @@ while [[ -L "$self" ]]; do
 done
 root="$(cd "$(dirname "$self")" && pwd)"
 
-src="$root/NotchCue.swift"
 plist="$root/Info.plist"
 app="$root/build/NotchCue.app"
 bin="$app/Contents/MacOS/notchcue"
+installed="$HOME/Applications/NotchCue.app"
 
-if [[ ! -x "$bin" || "$src" -nt "$bin" || "$plist" -nt "$bin" ]]; then
+needs_build=0
+[[ -x "$bin" && "$plist" -ot "$bin" ]] || needs_build=1
+for src in "$root"/Sources/*.swift; do
+  [[ "$src" -nt "$bin" ]] && needs_build=1
+done
+
+if [[ $needs_build == 1 ]]; then
   echo "Building NotchCue..." >&2
   mkdir -p "$app/Contents/MacOS"
-  swiftc -O "$src" -o "$bin"
+  swiftc -O "$root"/Sources/*.swift -o "$bin"
   cp "$plist" "$app/Contents/Info.plist"
   # Ad-hoc signature: enough for macOS to remember the permissions you grant.
   codesign --force --sign - "$app" >/dev/null 2>&1
+  # Keep the copy in ~/Applications (from `make install`) up to date.
+  if [[ -d "$installed" && -f "$installed/Contents/.notchcue-install" ]]; then
+    rm -rf "$installed"
+    ditto "$app" "$installed"
+    touch "$installed/Contents/.notchcue-install"
+  fi
 fi
 
 wait=0
+validate=0
 args=()
 prev=""
 for arg in "$@"; do
   case "$arg" in
     --wait) wait=1 ;;
+    --validate) validate=1; args+=("$arg") ;;
     -h|--help) exec "$bin" --help ;;
+    --self-test) exec "$bin" --self-test ;;
     -)
       # Save piped text to a file so the window can outlive this command.
       tmp="$(mktemp -t notchcue).txt"
@@ -48,7 +65,7 @@ for arg in "$@"; do
       ;;
     *)
       # The app starts in another directory, so pass the script file as a full path.
-      if [[ "$arg" != -* && "$prev" != --* && -f "$arg" ]]; then
+      if [[ "$arg" != -* && "$prev" != --* && -e "$arg" ]]; then
         arg="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
       fi
       args+=("$arg")
@@ -59,13 +76,14 @@ done
 
 # Catch bad options or unreadable files here, where the error is visible.
 "$bin" ${args[@]+"${args[@]}"} --validate
+[[ $validate == 1 ]] && exit 0
 
-# Close any NotchCue that's already open, so there's only one.
-pkill -f "$bin" 2>/dev/null || true
+# Close any NotchCue that's already open (from here or ~/Applications), so there's only one.
+pkill -f "NotchCue.app/Contents/MacOS/notchcue" 2>/dev/null || true
 
 if [[ $wait == 1 ]]; then
   open -W -n "$app" --args ${args[@]+"${args[@]}"}
 else
   open -n "$app" --args ${args[@]+"${args[@]}"}
-  echo "NotchCue opened at the top of the screen. Esc closes it."
+  echo "NotchCue opened at the top of the screen. Esc closes it; the menu bar icon has the rest."
 fi

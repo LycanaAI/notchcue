@@ -1,398 +1,47 @@
-// NotchCue: a macOS teleprompter that hangs down from the notch, right under the camera.
+// The panel that hangs from the notch, and the menu bar icon that controls it.
 //
 // By default it listens to you (Apple's built-in, on-device speech recognition) and
 // scrolls to wherever you are in the script, so it keeps your pace. It can also
 // scroll at a steady words-per-minute pace instead.
 //
-// Built into an app bundle and launched by the `notchcue` script. The bundle is needed
-// so macOS can ask for microphone and speech recognition permission.
-//
 // MIT licence. https://github.com/LycanaAI/notchcue
 
 import AppKit
-import AVFoundation
 import QuartzCore
-import Speech
 
-let sampleText = """
-[Sample text]
-This is NotchCue. Start reading out loud and the text follows your voice.
+let guideURL = URL(string: "https://github.com/LycanaAI/notchcue#readme")!
 
-If you pause, it waits for you. If you go back and say a line again, it jumps back to it.
-
-Press V to switch to a steady scroll, and Escape to close the window.
-"""
-
-let usageText = """
-Usage: notchcue [FILE | -] [options]
-
-Shows FILE (or text from --text, or stdin when FILE is "-") in a window that
-hangs down from the top centre of the screen, around the notch.
-
-By default it follows your voice: say the script out loud and it scrolls to
-keep the line you're on at the reading arrow. Words you've said turn grey.
-With --steady it scrolls at a fixed pace instead.
-
-Lines wrapped in square brackets, like [Hook], are shown as small grey cues
-and are not read out.
-
-Options:
-  --steady           Scroll at a steady pace instead of following your voice
-  --wpm N            Pace for --steady, in words per minute (default 150)
-  --locale ID        Speech recognition language (default: your system language, e.g. en-AU)
-  --text TEXT        Text to show instead of a file
-  --font-size N      Text size in points (default 40)
-  --countdown N      Seconds to count down before a steady scroll (default 3, 0 = none)
-  --width N          Window width in points (default 760)
-  --height N         Window height below the notch, in points (default 280)
-  --debug            Write what it hears to ~/Library/Logs/notchcue.log
-  --validate         Check the options and text, then exit without opening a window
-  -h, --help         Show this help
-
-Keys while running:
-  V            Switch between following your voice and a steady scroll
-  Space        Pause / resume
-  Up / Down    Steady scroll: faster / slower. Voice: move the place marker by a word
-  + / -        Bigger / smaller text
-  R            Back to the top
-  Esc or Q     Close
-Drag the window to move it.
-"""
-
-struct Options {
-    var text: String?
-    var file: String?
-    var followVoice = true
-    var wpm: Double = 150
-    var locale: String?
-    var fontSize: CGFloat = 40
-    var countdown = 3
-    var width: CGFloat = 760
-    var height: CGFloat = 280
-    var validateOnly = false
-    var debug = false
-}
-
-func fail(_ message: String) -> Never {
-    FileHandle.standardError.write(Data((message + "\n").utf8))
-    exit(2)
-}
-
-func parseOptions() -> Options {
-    var options = Options()
-    var args = Array(CommandLine.arguments.dropFirst())
-
-    func value(for name: String) -> String {
-        guard !args.isEmpty else { fail("\(name) needs a value") }
-        return args.removeFirst()
-    }
-    func number(for name: String, minimum: Double) -> Double {
-        guard let n = Double(value(for: name)), n >= minimum else { fail("\(name) must be a number of at least \(Int(minimum))") }
-        return n
-    }
-
-    while !args.isEmpty {
-        let arg = args.removeFirst()
-        switch arg {
-        case "-h", "--help":
-            print(usageText)
-            exit(0)
-        case "--steady": options.followVoice = false
-        case "--text": options.text = value(for: arg)
-        case "--wpm": options.wpm = number(for: arg, minimum: 20)
-        case "--locale": options.locale = value(for: arg)
-        case "--font-size": options.fontSize = CGFloat(number(for: arg, minimum: 12))
-        case "--countdown": options.countdown = Int(number(for: arg, minimum: 0))
-        case "--width": options.width = CGFloat(number(for: arg, minimum: 300))
-        case "--height": options.height = CGFloat(number(for: arg, minimum: 120))
-        case "--validate": options.validateOnly = true
-        case "--debug": options.debug = true
-        case "-": options.file = "/dev/stdin"
-        default:
-            // macOS adds this when an app is opened from Finder.
-            if arg.hasPrefix("-psn_") { continue }
-            if arg.hasPrefix("-") { fail("Unknown option: \(arg)\n\n\(usageText)") }
-            if options.file != nil { fail("Only one file can be shown at a time") }
-            options.file = arg
-        }
-    }
-    return options
-}
-
-func loadText(_ options: Options) -> String {
-    if let text = options.text { return text }
-    if let file = options.file {
-        guard let data = FileManager.default.contents(atPath: file),
-              let text = String(data: data, encoding: .utf8) else { fail("Can't read file: \(file)") }
-        return text
-    }
-    return sampleText
-}
-
-var debugLogging = false
-
-/// Notes for debugging, in ~/Library/Logs/notchcue.log. Only written with --debug.
-func log(_ message: String) {
-    guard debugLogging else { return }
-    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/notchcue.log")
-    let line = Data("\(Date()) \(message)\n".utf8)
-    if let handle = try? FileHandle(forWritingTo: url) {
-        handle.seekToEndOfFile()
-        handle.write(line)
-        try? handle.close()
-    } else {
-        try? line.write(to: url)
-    }
-}
-
-/// Lowercase letters and digits only, so "Codex," and "codex" match.
-func normalized(_ word: String) -> String {
-    String(word.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(Character.init))
-}
-
-/// A spoken word in the script and where it sits in the displayed text.
-struct Token {
-    let word: String
-    let range: NSRange
-}
-
-/// Turns plain text into styled paragraphs, and lists the words to be spoken.
-func styledText(_ text: String, fontSize: CGFloat) -> (NSAttributedString, [Token]) {
-    let bodyStyle = NSMutableParagraphStyle()
-    bodyStyle.lineSpacing = fontSize * 0.25
-    bodyStyle.paragraphSpacing = fontSize * 0.6
-    let body: [NSAttributedString.Key: Any] = [
-        .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold),
-        .foregroundColor: NSColor.white,
-        .paragraphStyle: bodyStyle,
-    ]
-    let cue: [NSAttributedString.Key: Any] = [
-        .font: NSFont.systemFont(ofSize: max(fontSize * 0.4, 12), weight: .bold),
-        .foregroundColor: NSColor(white: 0.5, alpha: 1),
-        .paragraphStyle: bodyStyle,
-    ]
-
-    let result = NSMutableAttributedString()
-    var tokens: [Token] = []
-    for rawLine in text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n") {
-        let line = rawLine.trimmingCharacters(in: .whitespaces)
-        if line.isEmpty { continue }
-        let isCue = line.hasPrefix("[") && line.hasSuffix("]")
-        if result.length > 0 { result.append(NSAttributedString(string: "\n", attributes: body)) }
-        let start = result.length
-        result.append(NSAttributedString(string: isCue ? line.uppercased() : line, attributes: isCue ? cue : body))
-        guard !isCue else { continue }
-        let ns = line as NSString
-        ns.enumerateSubstrings(in: NSRange(location: 0, length: ns.length), options: .byWords) { word, range, _, _ in
-            guard let word, !normalized(word).isEmpty else { return }
-            tokens.append(Token(word: normalized(word), range: NSRange(location: start + range.location, length: range.length)))
-        }
-    }
-    return (result, tokens)
-}
-
-/// Finds where in the script the speaker is, from the last few words heard.
-///
-/// Looks a little behind and well ahead of the current place, scores each spot by how
-/// many of the recent words line up with the script there, and only jumps backwards
-/// when the match is strong (you went back and said a line again).
-func matchPosition(heard: [String], script: [String], current: Int) -> Int? {
-    let recent = Array(heard.suffix(5))
-    guard let last = recent.last, !script.isEmpty else { return nil }
-
-    func same(_ a: String, _ b: String) -> Bool {
-        if a == b { return true }
-        // Partial results can cut a word short, and plurals or tenses can differ.
-        let shorter = min(a.count, b.count)
-        return shorter >= 4 && (a.hasPrefix(b) || b.hasPrefix(a))
-    }
-
-    var best: (index: Int, score: Int)?
-    let lower = max(0, current - 40)
-    let upper = min(script.count - 1, current + 30)
-    guard lower <= upper else { return nil }
-    for j in lower...upper where same(script[j], last) {
-        // Walk back through what was heard, allowing a skipped or misheard word.
-        var score = 1
-        var s = j - 1
-        for word in recent.dropLast().reversed() {
-            guard s >= 0 else { break }
-            if same(script[s], word) { score += 1; s -= 1 }
-            else if s >= 1 && same(script[s - 1], word) { score += 1; s -= 2 }
-        }
-        let backwards = j + 1 < current
-        let farAhead = j > current + 8
-        // Short or common words ("the", "a") are everywhere; need more evidence for far jumps.
-        if backwards && score < 3 { continue }
-        if farAhead && score < 2 { continue }
-        if score == 1 && last.count < 3 { continue }
-        // Prefer the strongest match; among equals, the one closest after the current place.
-        if best == nil || score > best!.score
-            || (score == best!.score && abs(j - current) < abs(best!.index - current)) {
-            best = (j, score)
-        }
-    }
-    return best.map { $0.index + 1 }
-}
-
-/// Listens to the microphone and reports the words heard so far, using Apple's
-/// on-device speech recognition when the Mac supports it (free and offline).
-final class VoiceFollower {
-    var onWords: (([String]) -> Void)?
-    var onStatus: ((String) -> Void)?
-
-    private let recognizer: SFSpeechRecognizer?
-    private let engine = AVAudioEngine()
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
-    private var hints: [String]
-    private(set) var running = false
-    private var quickFailures = 0
-
-    init(locale: String?, hints: [String]) {
-        let wanted = locale.map(Locale.init(identifier:)) ?? Locale.current
-        recognizer = SFSpeechRecognizer(locale: wanted) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-        self.hints = hints
-    }
-
-    var onDevice: Bool { recognizer?.supportsOnDeviceRecognition ?? false }
-
-    func start() {
-        guard let recognizer else { return report("Speech recognition isn't available for this language") }
-        log("locale \(recognizer.locale.identifier), on-device \(recognizer.supportsOnDeviceRecognition), available \(recognizer.isAvailable)")
-        SFSpeechRecognizer.requestAuthorization { status in
-            DispatchQueue.main.async {
-                guard status == .authorized else {
-                    return self.report("Speech recognition is off. Allow it in System Settings → Privacy & Security → Speech Recognition")
-                }
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    DispatchQueue.main.async {
-                        guard granted else {
-                            return self.report("Microphone access is off. Allow it in System Settings → Privacy & Security → Microphone")
-                        }
-                        guard recognizer.isAvailable else { return self.report("Speech recognition isn't available right now") }
-                        self.beginListening()
-                    }
-                }
-            }
-        }
-    }
-
-    func stop() {
-        running = false
-        task?.cancel()
-        request?.endAudio()
-        if engine.isRunning {
-            engine.stop()
-            engine.inputNode.removeTap(onBus: 0)
-        }
-    }
-
-    private func report(_ message: String) {
-        log("status: \(message)")
-        onStatus?(message)
-    }
-
-    private func beginListening() {
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.request?.append(buffer)
-        }
-        do {
-            engine.prepare()
-            try engine.start()
-        } catch {
-            return report("Couldn't start the microphone: \(error.localizedDescription)")
-        }
-        running = true
-        startTask()
-        report(onDevice ? "Listening (on this Mac)" : "Listening")
-    }
-
-    /// Recognition sessions end on their own after a while, so start a fresh one each time.
-    private func startTask() {
-        guard running, let recognizer else { return }
-        task?.cancel()
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
-        request.taskHint = .dictation
-        request.contextualStrings = hints
-        self.request = request
-        let started = CACurrentMediaTime()
-
-        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
-            if let error { log("recognition error: \(error)") }
-            if let result {
-                log("heard: \(result.bestTranscription.formattedString)")
-                let words = result.bestTranscription.segments.map { normalized($0.substring) }.filter { !$0.isEmpty }
-                DispatchQueue.main.async { self.onWords?(words) }
-            }
-            if error != nil || (result?.isFinal ?? false) {
-                DispatchQueue.main.async {
-                    guard self.running, self.request === request else { return }
-                    // A session that fails straight away will keep failing; stop and say why.
-                    if let error = error as NSError?, CACurrentMediaTime() - started < 2 {
-                        self.quickFailures += 1
-                        if error.code == 201 {
-                            self.stop()
-                            return self.report("Turn on Dictation first: System Settings → Keyboard → Dictation. Then press V")
-                        }
-                        if self.quickFailures >= 3 {
-                            self.stop()
-                            return self.report("Speech recognition stopped: \(error.localizedDescription). Press V to retry")
-                        }
-                    } else {
-                        self.quickFailures = 0
-                    }
-                    self.startTask()
-                }
-            }
-        }
-    }
-}
-
-/// Draws a marker showing where the line you're reading should sit.
-final class GuideView: NSView {
-    var readingY: CGFloat = 0 { didSet { needsDisplay = true } }
-    override var isFlipped: Bool { true }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-    override func draw(_ dirtyRect: NSRect) {
-        let arrow = NSBezierPath()
-        arrow.move(to: NSPoint(x: 14, y: readingY - 10))
-        arrow.line(to: NSPoint(x: 29, y: readingY))
-        arrow.line(to: NSPoint(x: 14, y: readingY + 10))
-        arrow.close()
-        NSColor.systemRed.setFill()
-        arrow.fill()
-    }
-}
-
-/// A borderless window that can still take key presses.
-final class PrompterWindow: NSWindow {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-}
-
-final class Prompter: NSObject, NSApplicationDelegate {
+final class Prompter: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var options: Options
-    let text: String
+    var text = ""
+    var hasScript: Bool { !text.isEmpty }
+    let launchText: String?
+    let launchPath: String?
+    var pendingURL: URL?
+    var launched = false
 
-    var window: NSWindow!
+    var window: PrompterWindow!
+    var content: DropView!
+    var mainView: PanelView!
     var scrollView: NSScrollView!
     var textView: NSTextView!
     var guide: GuideView!
     var hud: NSTextField!
     var countdownLabel: NSTextField!
+    var controls: ControlsBar!
+    var welcome: WelcomeView!
+    var help: HelpView!
+    var pill: PillView!
+    var statusItem: NSStatusItem!
+    var settingsController: SettingsWindowController?
 
     var frameTimer: Timer?
     var countdownTimer: Timer?
     var hudHide: DispatchWorkItem?
+    var controlsHide: DispatchWorkItem?
 
     var lastTick: CFTimeInterval = 0
+    var lastPillUpdate: CFTimeInterval = 0
     var paused = true
     var countingDown = false
     var position: CGFloat = 0
@@ -407,45 +56,120 @@ final class Prompter: NSObject, NSApplicationDelegate {
     var follower: VoiceFollower?
     var paceSamples: [(time: CFTimeInterval, cursor: Int)] = []
 
+    var screen: NSScreen!
     var topInset: CGFloat = 0            // height of the notch / menu bar strip at the top
+    var notchWidth: CGFloat = 0
     let readingLineFraction: CGFloat = 0.28
     let sideMargin: CGFloat = 44
 
-    init(options: Options, text: String) {
+    var minimised = false
+    var panelFrame = NSRect.zero         // the full panel's frame, kept while minimised
+    var resumeAfterMinimise = false
+    var resumeAfterHelp = false
+    var pinControls = false
+
+    init(options: Options, text: String?) {
         self.options = options
-        self.text = text
+        self.launchText = text
+        self.launchPath = options.file == "/dev/stdin" ? nil : options.file
+    }
+
+    // MARK: Launch
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = buildMainMenu()
+    }
+
+    /// Files dropped on the app icon, or opened with "Open With".
+    func application(_ application: NSApplication, open urls: [URL]) {
+        // A file given on the command line can also arrive here; it's already loaded.
+        let fresh = urls.filter { !(!launched && $0.path == launchPath) }
+        guard let url = fresh.last else { return }
+        if launched { showPanel(); openFile(url) } else { pendingURL = url }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Prefer the built-in screen with the notch (and its camera).
-        let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main ?? NSScreen.screens[0]
-        let frame = screen.frame
-        topInset = screen.safeAreaInsets.top > 0 ? screen.safeAreaInsets.top : frame.maxY - screen.visibleFrame.maxY
-        var notchWidth: CGFloat = 0
-        if let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea {
-            notchWidth = right.minX - left.maxX
+        buildPanel()
+        buildStatusItem()
+        installDebugHooks()
+
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handleKey(event) ? nil : event
         }
-        let width = min(max(options.width, notchWidth + 120), frame.width)
-        let height = min(options.height, frame.height / 2) + topInset
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(timer, forMode: .common)
+        frameTimer = timer
+
+        launched = true
+        if let launchText {
+            load(script: launchText, path: launchPath)
+        } else if let pendingURL {
+            openFile(pendingURL)
+        } else if options.sample {
+            load(script: sampleText, path: nil)
+        } else {
+            showWelcome()
+        }
+
+        switch options.show {
+        case "help": showHelp()
+        case "controls": pinControls = true; setControlsVisible(true)
+        case "minimised", "minimized": minimise()
+        case "settings": showSettings()
+        default: break
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationWillTerminate(_ notification: Notification) { follower?.stop() }
+
+    /// Opening the app again (Spotlight, Finder) brings the panel back.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showPanel()
+        if minimised { expand() }
+        return false
+    }
+
+    // MARK: Building the panel
+
+    func buildPanel() {
+        measureScreen()
+        let size = panelSize()
 
         // The top strip sits behind the notch and the menu bar; it's black so it blends in.
-        window = PrompterWindow(contentRect: NSRect(x: frame.midX - width / 2, y: frame.maxY - height, width: width, height: height),
-                                styleMask: [.borderless], backing: .buffered, defer: false)
+        window = PrompterWindow(contentRect: panelFrameAtTop(), styleMask: [.borderless], backing: .buffered, defer: false)
         window.backgroundColor = .clear
         window.isOpaque = false
         window.hasShadow = true
         window.level = .statusBar
         window.isMovableByWindowBackground = true
+        window.acceptsMouseMovedEvents = true
+        window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: .darkAqua)
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
-        let content = NSView(frame: NSRect(origin: .zero, size: window.frame.size))
-        content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor.black.cgColor
-        content.layer?.cornerRadius = 22
-        content.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        content = DropView(frame: NSRect(origin: .zero, size: size))
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        content.onDropFile = { [weak self] url in self?.openFile(url) }
+        content.onDropText = { [weak self] text in self?.load(script: text, path: nil) }
+        content.onDragHighlight = { [weak self] on in
+            self?.content.layer?.borderWidth = on ? 2 : 0
+            self?.content.layer?.borderColor = NSColor.systemBlue.cgColor
+        }
         window.contentView = content
 
-        let textArea = NSRect(x: 0, y: 0, width: content.bounds.width, height: content.bounds.height - topInset)
+        mainView = PanelView(frame: content.bounds)
+        mainView.autoresizingMask = [.width, .height]
+        mainView.onMouse = { [weak self] inside in self?.mouseMoved(inside: inside) }
+        content.addSubview(mainView)
+
+        let textArea = NSRect(x: 0, y: 0, width: mainView.bounds.width, height: mainView.bounds.height - topInset)
         scrollView = NSScrollView(frame: textArea)
         scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = false
@@ -460,45 +184,116 @@ final class Prompter: NSObject, NSApplicationDelegate {
         textView.isHorizontallyResizable = false
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.lineFragmentPadding = 0
+        textView.unregisterDraggedTypes()    // let drops reach the panel
         scrollView.documentView = textView
-        content.addSubview(scrollView)
+        mainView.addSubview(scrollView)
 
         guide = GuideView(frame: textArea)
         guide.autoresizingMask = [.width, .height]
-        content.addSubview(guide)
+        mainView.addSubview(guide)
+
+        welcome = WelcomeView(onOpen: { [weak self] in self?.openScriptPanel() },
+                              onSample: { [weak self] in self?.load(script: sampleText, path: nil) },
+                              onHelp: { [weak self] in self?.showHelp() })
+        welcome.frame = textArea.insetBy(dx: 12, dy: 10)
+        welcome.autoresizingMask = [.width, .height]
+        welcome.isHidden = true
+        mainView.addSubview(welcome)
 
         hud = makeLabel(size: 13, weight: .medium, color: NSColor(white: 0.6, alpha: 1))
+        // A black backing so the status line stays readable over the script.
+        hud.drawsBackground = true
+        hud.backgroundColor = .black
         countdownLabel = makeLabel(size: 90, weight: .bold, color: .white)
-        content.addSubview(hud)
-        content.addSubview(countdownLabel)
+        mainView.addSubview(hud)
+        mainView.addSubview(countdownLabel)
+
+        controls = ControlsBar(actions: .init(
+            pause: { [weak self] in self?.togglePause() },
+            mode: { [weak self] in self?.toggleMode() },
+            smaller: { [weak self] in self?.changeFontSize(by: -4) },
+            bigger: { [weak self] in self?.changeFontSize(by: 4) },
+            minimise: { [weak self] in self?.minimise() },
+            settings: { [weak self] in self?.showSettings() },
+            help: { [weak self] in self?.toggleHelp() },
+            close: { NSApp.terminate(nil) }))
+        controls.alphaValue = 0
+        controls.isHidden = true
+        mainView.addSubview(controls)
+
+        help = HelpView(onGuide: { NSWorkspace.shared.open(guideURL) }, onClose: { [weak self] in self?.hideHelp() })
+        help.frame = textArea
+        help.autoresizingMask = [.width, .height]
+        help.isHidden = true
+        mainView.addSubview(help)
+
         NSLayoutConstraint.activate([
-            hud.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            hud.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
-            countdownLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            hud.centerXAnchor.constraint(equalTo: mainView.centerXAnchor),
+            hud.bottomAnchor.constraint(equalTo: mainView.bottomAnchor, constant: -10),
+            countdownLabel.centerXAnchor.constraint(equalTo: mainView.centerXAnchor),
             countdownLabel.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+            controls.centerXAnchor.constraint(equalTo: mainView.centerXAnchor),
+            controls.bottomAnchor.constraint(equalTo: mainView.bottomAnchor, constant: -8),
         ])
 
-        reloadText(keepProgress: false)
+        pill = PillView(frame: .zero)
+        pill.notchWidth = notchWidth
+        pill.topInset = topInset
+        pill.autoresizingMask = [.width, .height]
+        pill.isHidden = true
+        pill.onClick = { [weak self] in self?.expand() }
+        content.addSubview(pill)
 
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self else { return event }
-            return self.handleKey(event) ? nil : event
-        }
-
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-
-        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in self?.tick() }
-        RunLoop.main.add(timer, forMode: .common)
-        frameTimer = timer
-
-        if options.followVoice { startFollowing() } else { startCountdown() }
+        updateControls()
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-    func applicationWillTerminate(_ notification: Notification) { follower?.stop() }
+    /// Picks the screen to use and measures its notch and menu bar.
+    func measureScreen() {
+        // Prefer the built-in screen with the notch (and its camera).
+        screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main ?? NSScreen.screens[0]
+        let frame = screen.frame
+        topInset = screen.safeAreaInsets.top > 0 ? screen.safeAreaInsets.top : frame.maxY - screen.visibleFrame.maxY
+        notchWidth = 0
+        if let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea {
+            notchWidth = right.minX - left.maxX
+        }
+    }
 
-    // MARK: Layout
+    /// Where the full panel goes: centred, its top edge at the very top of the screen.
+    func panelFrameAtTop() -> NSRect {
+        let size = panelSize()
+        let frame = screen.frame
+        return NSRect(x: frame.midX - size.width / 2, y: frame.maxY - size.height, width: size.width, height: size.height)
+    }
+
+    /// Displays were added, removed or rearranged: measure again and go back to the top.
+    @objc func screensChanged() {
+        measureScreen()
+        pill.topInset = topInset
+        pill.notchWidth = notchWidth
+        panelFrame = panelFrameAtTop()
+        if minimised {
+            window.setFrame(pillFrame(), display: true)
+        } else {
+            window.setFrame(panelFrame, display: true)
+            relayoutAfterResize()
+        }
+    }
+
+    /// The text area sits below the notch strip; keep it that way after a resize.
+    func relayoutAfterResize() {
+        let textArea = NSRect(x: 0, y: 0, width: mainView.bounds.width, height: mainView.bounds.height - topInset)
+        for view in [scrollView!, guide!, help!] as [NSView] { view.frame = textArea }
+        welcome.frame = textArea.insetBy(dx: 12, dy: 10)
+        if hasScript { relayout(keepProgress: true) }
+    }
+
+    func panelSize() -> NSSize {
+        let frame = screen.frame
+        let width = min(max(options.width, notchWidth + 120), frame.width)
+        let height = min(options.height, frame.height / 2) + topInset
+        return NSSize(width: width, height: height)
+    }
 
     func makeLabel(size: CGFloat, weight: NSFont.Weight, color: NSColor) -> NSTextField {
         let label = NSTextField(labelWithString: "")
@@ -507,6 +302,99 @@ final class Prompter: NSObject, NSApplicationDelegate {
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }
+
+    // MARK: Loading scripts
+
+    func showWelcome(message: String? = nil) {
+        welcome.isHidden = false
+        welcome.showMessage(message)
+        guide.isHidden = true
+        hud.isHidden = true
+        countdownLabel.isHidden = true
+        updateControls()
+    }
+
+    func load(script: String, path: String?) {
+        guard !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return showError("There's no text to show")
+        }
+        follower?.stop()
+        follower = nil
+        countdownTimer?.invalidate()
+        text = script
+        cursor = 0
+        paceSamples = []
+        if let path { RecentFiles.add(path) }
+        welcome.isHidden = true
+        guide.isHidden = false
+        if !help.isHidden { help.isHidden = true; resumeAfterHelp = false }
+        reloadText(keepProgress: false)
+        log("loaded \(path ?? "text"), \(tokens.count) words")
+        if minimised {
+            // Keep following quietly in the pill; a steady scroll waits for the panel.
+            if options.followVoice { startFollowing() } else { paused = true; resumeAfterMinimise = true }
+        } else if options.followVoice {
+            startFollowing()
+        } else {
+            startCountdown()
+        }
+        updateControls()
+    }
+
+    func openFile(_ url: URL) {
+        do {
+            let script = try scriptText(fromFileAt: url)
+            load(script: script, path: url.path)
+        } catch {
+            showError(error.localizedDescription)
+        }
+    }
+
+    /// Shows a problem in the panel: on the welcome screen, or in the status line.
+    func showError(_ message: String) {
+        log("error: \(message)")
+        showPanel()
+        if minimised { expand() }
+        if hasScript {
+            showHUD(message, color: .systemOrange, hideAfter: 6)
+        } else {
+            showWelcome(message: message)
+        }
+    }
+
+    func openScriptPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Open a Script"
+        panel.prompt = "Open"
+        panel.allowedContentTypes = ScriptFormat.contentTypes
+        panel.allowsOtherFileTypes = true
+        panel.canChooseDirectories = false
+        // Let the dialog sit above the panel while it's open.
+        let level = window.level
+        window.level = .floating
+        NSApp.activate(ignoringOtherApps: true)
+        let response = panel.runModal()
+        window.level = level
+        if response == .OK, let url = panel.url {
+            showPanel()
+            openFile(url)
+        }
+    }
+
+    func pasteScript() {
+        let pasteboard = NSPasteboard.general
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let url = urls.first {
+            return openFile(url)
+        }
+        guard let pasted = pasteboard.string(forType: .string), !pasted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return showError("There's no text on the clipboard to paste")
+        }
+        load(script: pasted, path: nil)
+        showHUD("Pasted script")
+    }
+
+    // MARK: Layout
 
     var progress: CGFloat {
         endOffset > startOffset ? (position - startOffset) / (endOffset - startOffset) : 0
@@ -555,15 +443,20 @@ final class Prompter: NSObject, NSApplicationDelegate {
         scrollView.alphaValue = 1
         options.followVoice = true
         paused = false
+        guard hasScript else { return updateControls() }
         if follower == nil {
             let hints = Array(Set(text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { $0.count > 3 }))
             let follower = VoiceFollower(locale: options.locale, hints: Array(hints.prefix(100)))
             follower.onWords = { [weak self] words in self?.heard(words) }
-            follower.onStatus = { [weak self] message in self?.showHUD(message, sticky: true) }
+            follower.onStatus = { [weak self] message in
+                self?.showHUD(message, sticky: true)
+                self?.updateControls()
+            }
             self.follower = follower
         }
         if follower?.running != true { follower?.start() }
         showHUD("Following your voice", sticky: true)
+        updateControls()
     }
 
     func heard(_ words: [String]) {
@@ -585,6 +478,7 @@ final class Prompter: NSObject, NSApplicationDelegate {
             storage.addAttribute(.foregroundColor, value: said ? NSColor(white: 1, alpha: 0.32) : NSColor.white, range: token.range)
         }
         storage.endEditing()
+        if minimised { updatePill() }
     }
 
     /// Where to scroll so the line with the next word to say sits on the reading arrow.
@@ -619,6 +513,9 @@ final class Prompter: NSObject, NSApplicationDelegate {
         let now = CACurrentMediaTime()
         let elapsed = min(now - lastTick, 0.1)
         lastTick = now
+        guard hasScript else { return }
+
+        if minimised && now - lastPillUpdate > 0.5 { updatePill() }
 
         // If the user scrolled by hand (trackpad), continue from where they left it.
         let actual = scrollView.contentView.bounds.origin.y
@@ -636,6 +533,7 @@ final class Prompter: NSObject, NSApplicationDelegate {
             setPosition(endOffset)
             paused = true
             showHUD("End · R to restart", sticky: true)
+            updateControls()
         } else {
             setPosition(next)
         }
@@ -644,6 +542,7 @@ final class Prompter: NSObject, NSApplicationDelegate {
     func startCountdown() {
         countdownTimer?.invalidate()
         paused = true
+        guard hasScript else { return }
         guard options.countdown > 0 else { return resume() }
         countingDown = true
         var remaining = options.countdown
@@ -657,9 +556,11 @@ final class Prompter: NSObject, NSApplicationDelegate {
         }
         RunLoop.main.add(timer, forMode: .common)
         countdownTimer = timer
+        updateControls()
     }
 
     func resume() {
+        guard hasScript else { return }
         countdownTimer?.invalidate()
         countingDown = false
         countdownLabel.isHidden = true
@@ -668,38 +569,72 @@ final class Prompter: NSObject, NSApplicationDelegate {
         lastTick = CACurrentMediaTime()
         paused = false
         showHUD(options.followVoice ? "Following your voice" : "\(Int(options.wpm)) wpm")
+        updateControls()
     }
 
-    // MARK: Keys
+    // MARK: Actions (keys, buttons and the menu all come here)
 
     func handleKey(_ event: NSEvent) -> Bool {
-        switch event.keyCode {
-        case 49: // space
-            if countingDown || paused { resume() } else { paused = true; showHUD("Paused", sticky: true) }
-        case 126: // up
-            if options.followVoice { moveCursor(by: -1) } else { changeSpeed(by: 10) }
-        case 125: // down
-            if options.followVoice { moveCursor(by: 1) } else { changeSpeed(by: -10) }
-        case 53: // escape
-            NSApp.terminate(nil)
-        default:
-            switch event.charactersIgnoringModifiers?.lowercased() {
+        // Only the panel's keys; typing in the Settings window is left alone.
+        guard event.window === window else { return false }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+
+        if flags.contains(.command) {
+            switch key {
+            case "o": openScriptPanel()
+            case "v": pasteScript()
+            case ",": showSettings()
             case "q": NSApp.terminate(nil)
-            case "r":
-                cursor = 0
-                markSpoken()
-                setPosition(startOffset)
-                if options.followVoice { resume() } else { startCountdown() }
+            case "m": toggleMinimise()
+            case "w": hidePanel()
+            default: return false
+            }
+            return true
+        }
+
+        if !help.isHidden && (event.keyCode == 53 || key == "?" || key == "/") {
+            hideHelp()
+            return true
+        }
+
+        switch event.keyCode {
+        case 49: togglePause()                                  // space
+        case 126: if options.followVoice { moveCursor(by: -1) } else { changeSpeed(by: 10) }   // up
+        case 125: if options.followVoice { moveCursor(by: 1) } else { changeSpeed(by: -10) }   // down
+        case 53: NSApp.terminate(nil)                           // escape
+        case 36, 76: if minimised { expand() } else { return false }   // return
+        default:
+            switch key {
+            case "q": NSApp.terminate(nil)
+            case "r": backToTop()
             case "v": toggleMode()
             case "=", "+": changeFontSize(by: 4)
             case "-", "_": changeFontSize(by: -4)
+            case "m": toggleMinimise()
+            case "?", "/", "h": toggleHelp()
             default: return false
             }
         }
         return true
     }
 
+    func togglePause() {
+        guard hasScript else { return }
+        if countingDown || paused { resume() } else { paused = true; showHUD("Paused", sticky: true) }
+        updateControls()
+    }
+
+    func backToTop() {
+        guard hasScript else { return }
+        cursor = 0
+        markSpoken()
+        setPosition(startOffset)
+        if options.followVoice { resume() } else { startCountdown() }
+    }
+
     func toggleMode() {
+        guard hasScript else { return }
         // If listening stopped (for example Dictation was off), V tries again.
         if options.followVoice && follower?.running == false {
             return startFollowing()
@@ -713,6 +648,10 @@ final class Prompter: NSObject, NSApplicationDelegate {
         }
     }
 
+    func setMode(voice: Bool) {
+        if voice != options.followVoice || (voice && follower?.running != true) { toggleMode() }
+    }
+
     func moveCursor(by delta: Int) {
         cursor = min(max(cursor + delta, 0), tokens.count)
         markSpoken()
@@ -720,35 +659,249 @@ final class Prompter: NSObject, NSApplicationDelegate {
 
     func changeSpeed(by delta: Double) {
         options.wpm = min(max(options.wpm + delta, 40), 400)
-        relayout(keepProgress: true)
+        if hasScript { relayout(keepProgress: true) }
         showHUD("\(Int(options.wpm)) wpm")
     }
 
     func changeFontSize(by delta: CGFloat) {
         options.fontSize = min(max(options.fontSize + delta, 20), 160)
-        reloadText(keepProgress: true)
+        if hasScript { reloadText(keepProgress: true) }
         showHUD("Text size \(Int(options.fontSize))")
     }
 
-    func showHUD(_ message: String, sticky: Bool = false) {
+    func showHUD(_ message: String, sticky: Bool = false, color: NSColor = NSColor(white: 0.6, alpha: 1), hideAfter: Double = 1.5) {
         hudHide?.cancel()
         hud.stringValue = message
-        hud.isHidden = false
+        hud.textColor = color
+        hud.isHidden = !hasScript
+        if minimised { updatePill() }
         guard !sticky else { return }
         let hide = DispatchWorkItem { [weak self] in self?.hud.isHidden = true }
         hudHide = hide
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: hide)
+        DispatchQueue.main.asyncAfter(deadline: .now() + hideAfter, execute: hide)
+    }
+
+    // MARK: Hover controls
+
+    func mouseMoved(inside: Bool) {
+        controlsHide?.cancel()
+        guard !pinControls else { return }
+        guard inside, help.isHidden else { return scheduleControlsHide(after: 0.4) }
+        setControlsVisible(true)
+        // While reading, get out of the way again once the mouse rests.
+        scheduleControlsHide(after: 2.5)
+    }
+
+    func scheduleControlsHide(after delay: Double) {
+        controlsHide?.cancel()
+        let hide = DispatchWorkItem { [weak self] in
+            guard let self, !self.pinControls else { return }
+            if self.controls.mouseInside { return self.scheduleControlsHide(after: 1.5) }
+            self.setControlsVisible(false)
+        }
+        controlsHide = hide
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: hide)
+    }
+
+    func setControlsVisible(_ visible: Bool) {
+        if visible { controls.isHidden = false }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = visible ? 0.15 : 0.35
+            controls.animator().alphaValue = visible ? 1 : 0
+            hud.animator().alphaValue = visible ? 0 : 1
+        } completionHandler: { [weak self] in
+            if !visible { self?.controls.isHidden = true }
+        }
+    }
+
+    func updateControls() {
+        controls?.update(paused: paused || countingDown || !hasScript, followVoice: options.followVoice)
+        if minimised { updatePill() }
+    }
+
+    // MARK: Help
+
+    func toggleHelp() { help.isHidden ? showHelp() : hideHelp() }
+
+    func showHelp() {
+        showPanel()
+        if minimised { expand() }
+        help.isHidden = false
+        setControlsVisible(false)
+        if hasScript && !options.followVoice && !paused { paused = true; resumeAfterHelp = true }
+        updateControls()
+    }
+
+    func hideHelp() {
+        help.isHidden = true
+        if resumeAfterHelp { resumeAfterHelp = false; resume() }
+    }
+
+    // MARK: Minimise
+
+    func toggleMinimise() { minimised ? expand() : minimise() }
+
+    func minimise() {
+        guard !minimised else { return }
+        if !help.isHidden { hideHelp() }
+        // A steady scroll stops while you can't see it; voice keeps tracking your place.
+        if hasScript && !options.followVoice && (!paused || countingDown) {
+            countdownTimer?.invalidate()
+            countingDown = false
+            countdownLabel.isHidden = true
+            scrollView.alphaValue = 1
+            paused = true
+            resumeAfterMinimise = true
+        }
+        showPanel()
+        panelFrame = window.frame
+        minimised = true
+        // Hide the hover controls now: the mouse-exit event never comes once the panel shrinks.
+        controlsHide?.cancel()
+        controls.mouseInside = false
+        controls.alphaValue = 0
+        controls.isHidden = true
+        hud.alphaValue = 1
+        // Take the full panel out of the window while it's small, so its fixed size and
+        // constraints can't pull the window back to the wrong size.
+        mainView.removeFromSuperview()
+        pill.frame = content.bounds
+        pill.isHidden = false
+        content.cornerRadius = 13
+        window.setFrame(pillFrame(), display: true, animate: true)
+        pill.frame = content.bounds
+        updatePill()
+    }
+
+    func expand() {
+        guard minimised else { return }
+        minimised = false
+        pill.isHidden = true
+        content.cornerRadius = 20
+        window.setFrame(panelFrame, display: true, animate: true)
+        if window.frame != panelFrame { window.setFrame(panelFrame, display: true) }
+        mainView.frame = content.bounds
+        mainView.autoresizingMask = [.width, .height]
+        content.addSubview(mainView, positioned: .below, relativeTo: pill)
+        content.layoutSubtreeIfNeeded()
+        if hasScript { relayout(keepProgress: true); markSpoken() }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if resumeAfterMinimise {
+            resumeAfterMinimise = false
+            if !options.followVoice { startCountdown() }
+        }
+        updateControls()
+    }
+
+    func pillFrame() -> NSRect {
+        let frame = (window.screen ?? screen).frame
+        let width = min(max(notchWidth + 200, 380), frame.width)
+        let height = topInset + 28
+        return NSRect(x: frame.midX - width / 2, y: frame.maxY - height, width: width, height: height)
+    }
+
+    func updatePill() {
+        lastPillUpdate = CACurrentMediaTime()
+        let (color, status): (NSColor, String)
+        if !hasScript {
+            (color, status) = (.systemGray, "No script")
+        } else if paused || countingDown {
+            (color, status) = (.systemOrange, "Paused")
+        } else if !options.followVoice {
+            (color, status) = (.systemBlue, "Scrolling")
+        } else if follower?.running == true {
+            (color, status) = (.systemGreen, "Listening")
+        } else {
+            (color, status) = (.systemGray, "Not listening")
+        }
+        let fraction: CGFloat? = hasScript ? (options.followVoice ? CGFloat(cursor) / CGFloat(max(tokens.count, 1)) : progress) : nil
+        pill.update(color: color, status: status, line: currentLineHint(), progress: fraction)
+    }
+
+    /// The rest of the line you're on, for the minimised pill.
+    func currentLineHint() -> String {
+        guard hasScript, let storage = textView.textStorage, storage.length > 0 else { return "Click to expand" }
+        let string = storage.string as NSString
+        var index: Int
+        if options.followVoice || tokens.isEmpty {
+            guard cursor < tokens.count else { return "End of script" }
+            index = tokens[cursor].range.location
+        } else {
+            guard let layout = textView.layoutManager, let container = textView.textContainer else { return "" }
+            let viewHeight = scrollView.contentView.bounds.height
+            let y = position + viewHeight * readingLineFraction - textView.textContainerOrigin.y
+            let glyph = layout.glyphIndex(for: NSPoint(x: 0, y: max(y, 0)), in: container)
+            index = layout.characterIndexForGlyph(at: glyph)
+            if let token = tokens.last(where: { $0.range.location <= index }) { index = token.range.location }
+        }
+        index = min(index, string.length - 1)
+        let paragraph = string.paragraphRange(for: NSRange(location: index, length: 0))
+        let rest = string.substring(with: NSRange(location: index, length: NSMaxRange(paragraph) - index))
+        return rest.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: Showing and hiding
+
+    func showPanel() {
+        if !window.isVisible { window.orderFront(nil) }
+    }
+
+    func hidePanel() { window.orderOut(nil) }
+
+    func togglePanel() {
+        if window.isVisible { hidePanel() } else { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    // MARK: Settings
+
+    func showSettings() {
+        if settingsController == nil {
+            settingsController = SettingsWindowController(settings: Settings.load()) { [weak self] s in self?.apply(settings: s) }
+        }
+        guard let settingsWindow = settingsController?.window else { return }
+        // Place it below the panel so they don't overlap.
+        let visible = screen.visibleFrame
+        let size = settingsWindow.frame.size
+        let top = min(window.frame.minY - 24, visible.maxY)
+        settingsWindow.setFrameOrigin(NSPoint(x: visible.midX - size.width / 2, y: max(top - size.height, visible.minY)))
+        NSApp.activate(ignoringOtherApps: true)
+        settingsController?.showWindow(nil)
+        settingsWindow.makeKeyAndOrderFront(nil)
+    }
+
+    /// Settings apply to the running panel straight away.
+    func apply(settings s: Settings) {
+        let fontSize = CGFloat(s.fontSize), width = CGFloat(s.width), height = CGFloat(s.height)
+        if fontSize != options.fontSize {
+            options.fontSize = fontSize
+            if hasScript { reloadText(keepProgress: true) }
+        }
+        if width != options.width || height != options.height {
+            options.width = width
+            options.height = height
+            resizePanel()
+        }
+        if s.wpm != options.wpm {
+            options.wpm = s.wpm
+            if hasScript { relayout(keepProgress: true) }
+        }
+        options.countdown = s.countdown
+        let locale = s.locale.isEmpty ? nil : s.locale
+        if locale != options.locale {
+            options.locale = locale
+            if options.followVoice && hasScript {
+                follower?.stop()
+                follower = nil
+                startFollowing()
+            }
+        }
+    }
+
+    func resizePanel() {
+        panelFrame = panelFrameAtTop()
+        guard !minimised else { return }
+        window.setFrame(panelFrame, display: true)
+        relayoutAfterResize()
     }
 }
-
-let options = parseOptions()
-let text = loadText(options)
-if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { fail("There's no text to show") }
-if options.validateOnly { exit(0) }
-debugLogging = options.debug
-
-let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
-let prompter = Prompter(options: options, text: text)
-app.delegate = prompter
-app.run()
