@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Opens NotchCue at the top centre of the screen, around the notch.
-# Builds the app on first run or after the source changes.
+# In a source checkout it builds the app on first run or after the source changes;
+# inside an installed NotchCue.app (Contents/Resources/notchcue) it just opens that app.
 #
 #   notchcue script.txt                     # follows your voice
 #   notchcue notes.md                       # Markdown, Word, RTF, HTML and PDF work too
@@ -13,7 +14,7 @@
 # Run with --help for all options and keys.
 set -euo pipefail
 
-# Resolve symlinks (e.g. ~/.local/bin/notchcue -> this file) to find the repo.
+# Resolve symlinks (e.g. ~/.local/bin/notchcue or Homebrew's link -> this file).
 self="${BASH_SOURCE[0]}"
 while [[ -L "$self" ]]; do
   link="$(readlink "$self")"
@@ -21,28 +22,47 @@ while [[ -L "$self" ]]; do
 done
 root="$(cd "$(dirname "$self")" && pwd)"
 
-plist="$root/Info.plist"
-app="$root/build/NotchCue.app"
-bin="$app/Contents/MacOS/notchcue"
-installed="$HOME/Applications/NotchCue.app"
+if [[ "$root" == */Contents/Resources && -x "$root/../MacOS/notchcue" ]]; then
+  # Installed copy: this script lives inside NotchCue.app, so just open that app.
+  app="$(cd "$root/../.." && pwd)"
+  bin="$app/Contents/MacOS/notchcue"
+else
+  # Source checkout: build into build/NotchCue.app when the source has changed.
+  plist="$root/Info.plist"
+  app="$root/build/NotchCue.app"
+  bin="$app/Contents/MacOS/notchcue"
+  installed="$HOME/Applications/NotchCue.app"
 
-needs_build=0
-[[ -x "$bin" && "$plist" -ot "$bin" ]] || needs_build=1
-for src in "$root"/Sources/*.swift; do
-  [[ "$src" -nt "$bin" ]] && needs_build=1
-done
+  needs_build=0
+  [[ -x "$bin" && "$plist" -ot "$bin" && "$self" -ot "$bin" && "$root/scripts/build-app.sh" -ot "$bin" ]] || needs_build=1
+  for src in "$root"/Sources/*.swift; do
+    [[ "$src" -nt "$bin" ]] && needs_build=1
+  done
 
-if [[ $needs_build == 1 ]]; then
-  echo "Building NotchCue..." >&2
-  mkdir -p "$app/Contents/MacOS"
-  swiftc -O "$root"/Sources/*.swift -o "$bin"
-  cp "$plist" "$app/Contents/Info.plist"
-  # Ad-hoc signature: enough for macOS to remember the permissions you grant.
-  codesign --force --sign - "$app" >/dev/null 2>&1
-  # Keep the copy in ~/Applications (from `make install`) up to date.
-  if [[ -d "$installed" ]] && [[ "$(plutil -extract CFBundleIdentifier raw "$installed/Contents/Info.plist" 2>/dev/null)" == "ai.lycana.notchcue" ]]; then
-    rm -rf "$installed"
-    ditto "$app" "$installed"
+  if [[ $needs_build == 1 ]]; then
+    echo "Building NotchCue..." >&2
+    "$root/scripts/build-app.sh" "$app"
+    # Sign with a stable identity so macOS remembers the microphone and speech
+    # permissions across rebuilds. NOTCHCUE_SIGN_IDENTITY overrides the choice
+    # ("-" for ad-hoc); otherwise the first Apple Development certificate is
+    # used, or an ad-hoc signature when there isn't one.
+    identity="${NOTCHCUE_SIGN_IDENTITY:-}"
+    if [[ -z "$identity" ]]; then
+      identity="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development/ { print $2; exit }')"
+    fi
+    identity="${identity:--}"
+    if ! codesign --force --sign "$identity" "$app" >/dev/null 2>&1; then
+      echo "Couldn't sign with \"$identity\"; using an ad-hoc signature (macOS will ask for permissions again after each rebuild)." >&2
+      codesign --force --sign - "$app" >/dev/null 2>&1
+    fi
+    # Keep the copy in ~/Applications (from `make install`) up to date, unless
+    # it's a notarised release (Developer ID), which a local build shouldn't replace.
+    if [[ -d "$installed" ]] \
+      && [[ "$(plutil -extract CFBundleIdentifier raw "$installed/Contents/Info.plist" 2>/dev/null)" == "ai.lycana.notchcue" ]] \
+      && [[ "$(codesign -dv --verbose=2 "$installed" 2>&1)" != *"Authority=Developer ID Application"* ]]; then
+      rm -rf "$installed"
+      ditto "$app" "$installed"
+    fi
   fi
 fi
 
