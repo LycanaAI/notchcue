@@ -4,7 +4,7 @@ APP = build/NotchCue.app
 SOURCES = $(wildcard Sources/*.swift)
 LSREGISTER = /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
-.PHONY: build install uninstall clean check test
+.PHONY: build install uninstall clean check test release publish
 
 # Build the app bundle (the notchcue script also does this on first run).
 build:
@@ -25,7 +25,17 @@ uninstall:
 	rm -rf "$(APPDIR)/NotchCue.app"
 
 clean:
-	rm -rf build
+	rm -rf build dist
+
+# Signed (Developer ID), notarised and stapled zip in dist/. Publishes nothing.
+# See docs/releasing.md.
+release:
+	@scripts/release.sh
+
+# Tag, GitHub release and Homebrew cask update for the zip in dist/.
+# Only once the repo is public; asks before changing anything.
+publish:
+	@scripts/publish.sh
 
 # Compile and run the built-in tests, without signing or launching (used by CI).
 check:
