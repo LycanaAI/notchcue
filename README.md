@@ -2,6 +2,8 @@
 
 A teleprompter for macOS that hangs down from the notch, right under your camera, and follows your voice.
 
+<p align="center"><img src="docs/demo.gif" width="760" alt="NotchCue following a voice: words turn grey as they're read and the panel scrolls along"></p>
+
 Read your script out loud and NotchCue scrolls along with you. Words you've said turn grey, it waits when you pause, and if you go back and say a line again it jumps back to it. Because the text sits right below the camera, your eyes stay close to the lens.
 
 It only uses what's built into macOS: Apple's speech recognition runs on your Mac, so it works offline and nothing is sent anywhere by NotchCue. No accounts, no subscription.
