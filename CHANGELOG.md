@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- README reorganised: what it is, install, how to use, contributing.
+
 ## 0.2.1
 
 Signed, notarised releases and a Homebrew cask.
