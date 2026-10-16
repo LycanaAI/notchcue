@@ -16,7 +16,6 @@ install: build
 	mkdir -p "$(APPDIR)" "$(PREFIX)/bin"
 	rm -rf "$(APPDIR)/NotchCue.app"
 	ditto "$(APP)" "$(APPDIR)/NotchCue.app"
-	touch "$(APPDIR)/NotchCue.app/Contents/.notchcue-install"
 	-$(LSREGISTER) -f "$(APPDIR)/NotchCue.app" 2>/dev/null
 	ln -sf "$(CURDIR)/notchcue" "$(PREFIX)/bin/notchcue"
 	@echo "Installed: $(APPDIR)/NotchCue.app and $(PREFIX)/bin/notchcue"

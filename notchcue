@@ -40,10 +40,9 @@ if [[ $needs_build == 1 ]]; then
   # Ad-hoc signature: enough for macOS to remember the permissions you grant.
   codesign --force --sign - "$app" >/dev/null 2>&1
   # Keep the copy in ~/Applications (from `make install`) up to date.
-  if [[ -d "$installed" && -f "$installed/Contents/.notchcue-install" ]]; then
+  if [[ -d "$installed" ]] && [[ "$(plutil -extract CFBundleIdentifier raw "$installed/Contents/Info.plist" 2>/dev/null)" == "ai.lycana.notchcue" ]]; then
     rm -rf "$installed"
     ditto "$app" "$installed"
-    touch "$installed/Contents/.notchcue-install"
   fi
 fi
 
