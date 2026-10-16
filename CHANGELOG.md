@@ -2,12 +2,12 @@
 
 ## 0.2.1
 
-Signed, notarised releases and a Homebrew cask (coming soon).
+Signed, notarised releases and a Homebrew cask.
 
 ### Added
 
 - **Signed and notarised releases.** `make release` builds NotchCue.app for Apple silicon and Intel, signs it with a Developer ID and the hardened runtime, has Apple notarise it and staples the result into `dist/NotchCue-<version>.zip`. macOS opens releases without warnings, and permissions carry over between updates.
-- **Homebrew cask** (coming soon): `brew install --cask lycanaai/tap/notchcue`.
+- **Homebrew cask**: `brew install --cask lycanaai/tap/notchcue`.
 - **`notchcue` inside the app.** The launcher now ships in `NotchCue.app/Contents/Resources/notchcue`. Run from an installed app (or a link to it, as Homebrew makes), it opens that app and compiles nothing.
 - `make publish` tags the release, uploads the zip to GitHub Releases and updates the Homebrew cask. See docs/releasing.md.
 

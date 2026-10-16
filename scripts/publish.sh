@@ -120,7 +120,9 @@ sed -i '' -E \
 grep -q "version \"$version\"" "$cask" && grep -q "sha256 \"$sha\"" "$cask" || fail "couldn't update $cask"
 ruby -c "$cask" >/dev/null
 git -C "$tap_dir" add Casks/notchcue.rb
-git -C "$tap_dir" commit -m "notchcue $version"
+# Commit as the same author as this repo, not the global git identity.
+git -C "$tap_dir" -c user.name="$(git config user.name)" -c user.email="$(git config user.email)" \
+  commit -m "notchcue $version"
 git -C "$tap_dir" push
 
 step "Published NotchCue $version"

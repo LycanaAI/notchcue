@@ -12,13 +12,13 @@ It only uses what's built into macOS: Apple's speech recognition runs on your Ma
 
 Needs macOS 13 (Ventura) or later, on Apple silicon or Intel.
 
-### Homebrew (coming soon)
+### Homebrew
 
 ```sh
 brew install --cask lycanaai/tap/notchcue
 ```
 
-This installs NotchCue.app into `/Applications` and the `notchcue` command into Homebrew's `bin`. `brew upgrade --cask notchcue` updates both. Not available yet: it will work once the first public release is out.
+This installs NotchCue.app into `/Applications` and the `notchcue` command into Homebrew's `bin`. `brew upgrade --cask notchcue` updates both.
 
 ### Download
 
